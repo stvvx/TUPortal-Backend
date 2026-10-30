@@ -1315,6 +1315,64 @@ app.get('/api/teaching/subjects', authenticateToken, requireTeachingStaff, async
   }
 });
 
+app.get('/api/teaching/subjects/:subjectId/students', authenticateToken, requireTeachingStaff, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.subjectId)) {
+      return res.status(400).json({ error: 'Valid subject is required.' });
+    }
+
+    const subjectId = new ObjectId(req.params.subjectId);
+    const assignment = await assignmentsCollection.findOne({
+      subjectId,
+      ...(req.user.role === 'program_chair' ? {} : { facultyId: new ObjectId(req.user.userId) })
+    });
+    if (!assignment) {
+      return res.status(403).json({ error: 'You can only view students for assigned subjects.' });
+    }
+
+    const enrollments = await enrollmentsCollection.find(
+      { subjectId },
+      { projection: { studentId: 1 } }
+    ).toArray();
+    const studentIds = enrollments
+      .map((enrollment) => enrollment.studentId)
+      .filter((studentId) => studentId instanceof ObjectId);
+    if (studentIds.length === 0) return res.json({ students: [] });
+
+    const [users, profiles] = await Promise.all([
+      usersCollection.find(
+        { _id: { $in: studentIds }, role: 'student' },
+        { projection: { password: 0 } }
+      ).toArray(),
+      studentsCollection.find(
+        { userId: { $in: studentIds } },
+        { projection: { userId: 1, sectionId: 1 } }
+      ).toArray()
+    ]);
+    const profilesByUserId = new Map(profiles.map((profile) => [profile.userId.toString(), profile]));
+
+    const students = users.map((student) => {
+      const nameFields = getUserNameFields(student);
+      const profile = profilesByUserId.get(student._id.toString());
+      return {
+        id: student._id.toString(),
+        ...nameFields,
+        name: student.name || [nameFields.firstName, nameFields.middleName, nameFields.lastName].filter(Boolean).join(' '),
+        sectionId: profile?.sectionId?.toString() || null
+      };
+    }).sort((a, b) =>
+      a.lastName.localeCompare(b.lastName, undefined, { sensitivity: 'base' }) ||
+      a.firstName.localeCompare(b.firstName, undefined, { sensitivity: 'base' }) ||
+      a.middleName.localeCompare(b.middleName, undefined, { sensitivity: 'base' })
+    );
+
+    return res.json({ students });
+  } catch (error) {
+    console.error('Error fetching enrolled students for teaching subject:', error);
+    return res.status(500).json({ error: 'Failed to fetch enrolled students.' });
+  }
+});
+
 app.get('/api/teaching/lessons', authenticateToken, requireTeachingStaff, async (req, res) => {
   try {
     const assignments = await getTeachingAssignments(req.user.userId);
