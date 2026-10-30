@@ -1320,10 +1320,15 @@ app.get('/api/teaching/subjects/:subjectId/students', authenticateToken, require
     if (!ObjectId.isValid(req.params.subjectId)) {
       return res.status(400).json({ error: 'Valid subject is required.' });
     }
+    if (!ObjectId.isValid(req.query.sectionId)) {
+      return res.status(400).json({ error: 'Valid section is required.' });
+    }
 
     const subjectId = new ObjectId(req.params.subjectId);
+    const sectionId = new ObjectId(req.query.sectionId);
     const assignment = await assignmentsCollection.findOne({
       subjectId,
+      sectionId,
       ...(req.user.role === 'program_chair' ? {} : { facultyId: new ObjectId(req.user.userId) })
     });
     if (!assignment) {
@@ -1351,7 +1356,10 @@ app.get('/api/teaching/subjects/:subjectId/students', authenticateToken, require
     ]);
     const profilesByUserId = new Map(profiles.map((profile) => [profile.userId.toString(), profile]));
 
-    const students = users.map((student) => {
+    const students = users.filter((student) => {
+      const profile = profilesByUserId.get(student._id.toString());
+      return profile?.sectionId?.toString() === sectionId.toString();
+    }).map((student) => {
       const nameFields = getUserNameFields(student);
       const profile = profilesByUserId.get(student._id.toString());
       return {
