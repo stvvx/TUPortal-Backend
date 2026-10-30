@@ -1,0 +1,20 @@
+{
+  "name": "itproflms-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Backend service for ITPROFlms",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^16.6.1",
+    "express": "^5.3.0",
+    "jsonwebtoken": "^9.0.3",
+    "mongodb": "^6.20.0",
+    "multer": "^2.4.0"
+  }
+}
