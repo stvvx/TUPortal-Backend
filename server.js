@@ -12,10 +12,10 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('node:fs');
 const path = require('node:path');
-const { execFile } = require('node:child_process');
-const { promisify } = require('node:util');
+const { Readable } = require('node:stream');
 const multer = require('multer');
-const { MongoClient, ObjectId } = require('mongodb');
+const { convert: convertPptxToPdf } = require('pptx-to-pdf');
+const { GridFSBucket, MongoClient, ObjectId } = require('mongodb');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
@@ -25,7 +25,6 @@ const mongoUri = process.env.MONGODB_URI;
 const databaseName = process.env.MONGODB_DB_NAME || 'itproflms';
 const jwtSecret = process.env.JWT_SECRET || 'itproflms_jwt_secret_fallback_2026';
 const lessonUploadDirectory = path.join(__dirname, 'uploads', 'lessons');
-const execFileAsync = promisify(execFile);
 fs.mkdirSync(lessonUploadDirectory, { recursive: true });
 const lessonUpload = multer({
   storage: multer.diskStorage({
@@ -51,45 +50,50 @@ async function prepareLessonFile(filePath, fileName) {
     return { fileName, filePath };
   }
 
-  const converterCandidates = [
-    process.env.PPTX_CONVERTER_PATH,
-    'soffice',
-    ...(process.platform === 'win32'
-      ? [
-        'C:\\Program Files\\LibreOffice\\program\\soffice.exe',
-        'C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe'
-      ]
-      : ['/usr/bin/soffice', '/usr/local/bin/soffice'])
-  ].filter(Boolean);
   const pdfFileName = `${path.basename(fileName, extension)}.pdf`;
   const pdfFilePath = path.join(lessonUploadDirectory, pdfFileName);
 
   try {
-    let lastError;
-    for (const converter of converterCandidates) {
-      try {
-        await execFileAsync(converter, [
-          '--headless',
-          '--convert-to', 'pdf',
-          '--outdir', lessonUploadDirectory,
-          filePath
-        ], { timeout: 120000 });
-        if (fs.existsSync(pdfFilePath)) break;
-        lastError = new Error('The converter did not produce a PDF file.');
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    if (!fs.existsSync(pdfFilePath)) {
-      throw lastError || new Error('No LibreOffice converter was found.');
-    }
-    fs.unlinkSync(filePath);
+    const pptxBuffer = await fs.promises.readFile(filePath);
+    const pdfBuffer = await convertPptxToPdf(pptxBuffer);
+    await fs.promises.writeFile(pdfFilePath, pdfBuffer);
+    await fs.promises.unlink(filePath);
     return { fileName: pdfFileName, filePath: pdfFilePath };
   } catch (error) {
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    await Promise.all([
+      fs.promises.rm(filePath, { force: true }),
+      fs.promises.rm(pdfFilePath, { force: true })
+    ]);
     throw new Error(
-      `Unable to convert PPTX to PDF. Install LibreOffice or set PPTX_CONVERTER_PATH to soffice.exe. ${error.message}`
+      `Unable to convert PPTX to PDF on the server. ${error.message}`
     );
+  }
+}
+
+async function storeLessonFile(preparedFile, mimeType) {
+  const buffer = await fs.promises.readFile(preparedFile.filePath);
+  const uploadStream = lessonFileBucket.openUploadStream(preparedFile.fileName, {
+    metadata: { contentType: mimeType || 'application/pdf' }
+  });
+
+  await new Promise((resolve, reject) => {
+    uploadStream.once('finish', resolve);
+    uploadStream.once('error', reject);
+    Readable.from(buffer).pipe(uploadStream);
+  });
+  await fs.promises.unlink(preparedFile.filePath);
+  return uploadStream.id;
+}
+
+async function deleteLessonFile(lesson) {
+  const localFilePath = lesson.fileName
+    ? path.join(lessonUploadDirectory, lesson.fileName)
+    : null;
+  if (localFilePath && fs.existsSync(localFilePath)) {
+    await fs.promises.unlink(localFilePath);
+  }
+  if (lesson.fileId && lessonFileBucket) {
+    await lessonFileBucket.delete(new ObjectId(lesson.fileId));
   }
 }
 
@@ -102,14 +106,10 @@ app.use(cors());
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
-app.get('/uploads/lessons/:filename', (req, res) => {
+app.get('/uploads/lessons/:filename', async (req, res) => {
   const requestedFile = req.params.filename;
   const safeFilename = path.basename(requestedFile);
   const filePath = path.join(lessonUploadDirectory, safeFilename);
-
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: 'Lesson file not found.' });
-  }
 
   const extension = path.extname(safeFilename).toLowerCase();
   const mimeType = {
@@ -123,7 +123,29 @@ app.get('/uploads/lessons/:filename', (req, res) => {
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-  res.sendFile(filePath);
+
+  if (fs.existsSync(filePath)) {
+    return res.sendFile(filePath);
+  }
+
+  try {
+    const storedFile = await database?.collection('lessonFiles.files').findOne({ filename: safeFilename });
+    if (!storedFile || !lessonFileBucket) {
+      return res.status(404).json({ error: 'Lesson file not found.' });
+    }
+    res.setHeader('Content-Type', storedFile.metadata?.contentType || mimeType);
+    res.setHeader('Content-Length', storedFile.length);
+    const downloadStream = lessonFileBucket.openDownloadStream(storedFile._id);
+    downloadStream.on('error', (error) => {
+      console.error('Error streaming lesson file:', error);
+      if (!res.headersSent) res.status(404).json({ error: 'Lesson file not found.' });
+      else res.destroy(error);
+    });
+    downloadStream.pipe(res);
+  } catch (error) {
+    console.error('Error retrieving lesson file:', error);
+    return res.status(500).json({ error: 'Failed to retrieve lesson file.' });
+  }
 });
 
 // Request logger
@@ -150,6 +172,7 @@ let programsCollection;
 let coursesCollection;
 let sectionsCollection;
 let academicSettingsCollection;
+let lessonFileBucket;
 
 // Authentication Middleware for protected routes
 function authenticateToken(req, res, next) {
@@ -1585,6 +1608,7 @@ app.post('/api/teaching/lessons/upload-base64', authenticateToken, requireTeachi
     const uploadedPath = path.join(lessonUploadDirectory, safeName);
     fs.writeFileSync(uploadedPath, buffer);
     const preparedFile = await prepareLessonFile(uploadedPath, safeName);
+    const fileId = await storeLessonFile(preparedFile, mimeType);
 
     const now = new Date();
     const lesson = {
@@ -1593,6 +1617,7 @@ app.post('/api/teaching/lessons/upload-base64', authenticateToken, requireTeachi
       description: typeof description === 'string' ? description.trim() : '',
       type: 'file',
       fileName: preparedFile.fileName,
+      fileId,
       slides: [],
       createdBy: new ObjectId(req.user.userId),
       createdAt: now,
@@ -1625,12 +1650,14 @@ app.post('/api/teaching/lessons/upload', authenticateToken, requireTeachingStaff
       }
       const now = new Date();
       const preparedFile = await prepareLessonFile(req.file.path, req.file.filename);
+      const fileId = await storeLessonFile(preparedFile, req.file.mimetype);
       const lesson = {
         subjectId: new ObjectId(subjectId),
         title: title.trim(),
         description: typeof description === 'string' ? description.trim() : '',
         type: 'file',
         fileName: preparedFile.fileName,
+        fileId,
         slides: [],
         createdBy: new ObjectId(req.user.userId),
         createdAt: now,
@@ -1668,14 +1695,12 @@ app.patch('/api/teaching/lessons/:lessonId/upload-base64', authenticateToken, re
     const uploadedPath = path.join(lessonUploadDirectory, safeName);
     fs.writeFileSync(uploadedPath, buffer);
     const preparedFile = await prepareLessonFile(uploadedPath, safeName);
-
-    if (lesson.fileName) {
-      const oldFilePath = path.join(lessonUploadDirectory, lesson.fileName);
-      if (fs.existsSync(oldFilePath)) fs.unlinkSync(oldFilePath);
-    }
+    const fileId = await storeLessonFile(preparedFile, mimeType);
+    await deleteLessonFile(lesson);
 
     const updates = {
       fileName: preparedFile.fileName,
+      fileId,
       type: 'file',
       slides: [],
       updatedAt: new Date()
@@ -1745,17 +1770,16 @@ app.patch('/api/teaching/lessons/:lessonId/upload', authenticateToken, requireTe
         return res.status(403).json({ error: 'You can only edit lessons for assigned subjects.' });
       }
       const preparedFile = await prepareLessonFile(req.file.path, req.file.filename);
+      const fileId = await storeLessonFile(preparedFile, req.file.mimetype);
       const updates = {
         fileName: preparedFile.fileName,
+        fileId,
         type: 'file',
         slides: [],
         updatedAt: new Date()
       };
       await lessonsCollection.updateOne({ _id: lesson._id }, { $set: updates });
-      if (lesson.fileName) {
-        const oldFilePath = path.join(lessonUploadDirectory, lesson.fileName);
-        if (fs.existsSync(oldFilePath)) fs.unlinkSync(oldFilePath);
-      }
+      await deleteLessonFile(lesson);
       return res.json({ lesson: serializeLesson({ ...lesson, ...updates }) });
     } catch (error) {
       console.error('Error replacing lesson file:', error);
@@ -1776,10 +1800,7 @@ app.delete('/api/teaching/lessons/:lessonId', authenticateToken, requireTeaching
       return res.status(403).json({ error: 'You can only delete lessons for assigned subjects.' });
     }
     await lessonsCollection.deleteOne({ _id: lesson._id });
-    if (lesson.fileName) {
-      const filePath = path.join(lessonUploadDirectory, lesson.fileName);
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    }
+    await deleteLessonFile(lesson);
     return res.json({ message: 'Lesson deleted successfully.' });
   } catch (error) {
     console.error('Error deleting lesson:', error);
@@ -2435,6 +2456,7 @@ app.use((req, res) => {
 async function start() {
   await mongoClient.connect();
   database = mongoClient.db(databaseName);
+  lessonFileBucket = new GridFSBucket(database, { bucketName: 'lessonFiles' });
   usersCollection = database.collection('users');
   subjectsCollection = database.collection('subjects');
   enrollmentsCollection = database.collection('enrollments');
