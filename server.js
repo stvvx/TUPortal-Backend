@@ -767,18 +767,42 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
     }
 
     if (role === 'faculty') {
-      const facultyAssignments = await assignmentsCollection.countDocuments({
+      const facultySubjectAssignments = await assignmentsCollection.find({
         facultyId: new ObjectId(req.user.userId)
-      });
+      }, { projection: { subjectId: 1 } }).toArray();
+      const facultySubjectIds = [...new Map(
+        facultySubjectAssignments.map((assignment) => [assignment.subjectId.toString(), assignment.subjectId])
+      ).values()];
+      const facultyQuizzes = facultySubjectIds.length
+        ? await quizzesCollection.find(
+            { subjectId: { $in: facultySubjectIds } },
+            { projection: { _id: 1 } }
+          ).toArray()
+        : [];
+      const [lessonCount, gradeCount] = facultySubjectIds.length
+        ? await Promise.all([
+            lessonsCollection.countDocuments({ subjectId: { $in: facultySubjectIds } }),
+            quizSubmissionsCollection.countDocuments({
+              quizId: { $in: facultyQuizzes.map((quiz) => quiz._id) }
+            })
+          ])
+        : [0, 0];
+      const examCount = facultyQuizzes.length;
+      const facultyAssignments = facultySubjectIds.length;
       return res.json({
         role,
         chart: [
           { label: 'Subjects', value: facultyAssignments },
-          { label: 'Lessons', value: 0 },
-          { label: 'Exams', value: 0 },
-          { label: 'Grades', value: 0 }
+          { label: 'Lessons', value: lessonCount },
+          { label: 'Exams', value: examCount },
+          { label: 'Grades', value: gradeCount }
         ],
-        totals: { assignedSubjects: facultyAssignments }
+        totals: {
+          assignedSubjects: facultyAssignments,
+          lessons: lessonCount,
+          exams: examCount,
+          grades: gradeCount
+        }
       });
     }
 
