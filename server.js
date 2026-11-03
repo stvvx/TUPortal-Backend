@@ -14,7 +14,6 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { Readable } = require('node:stream');
 const multer = require('multer');
-const { convert: convertPptxToPdf } = require('pptx-to-pdf');
 const { GridFSBucket, MongoClient, ObjectId } = require('mongodb');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -45,29 +44,7 @@ const lessonUpload = multer({
 });
 
 async function prepareLessonFile(filePath, fileName) {
-  const extension = path.extname(fileName).toLowerCase();
-  if (extension !== '.pptx') {
-    return { fileName, filePath };
-  }
-
-  const pdfFileName = `${path.basename(fileName, extension)}.pdf`;
-  const pdfFilePath = path.join(lessonUploadDirectory, pdfFileName);
-
-  try {
-    const pptxBuffer = await fs.promises.readFile(filePath);
-    const pdfBuffer = await convertPptxToPdf(pptxBuffer);
-    await fs.promises.writeFile(pdfFilePath, pdfBuffer);
-    await fs.promises.unlink(filePath);
-    return { fileName: pdfFileName, filePath: pdfFilePath };
-  } catch (error) {
-    await Promise.all([
-      fs.promises.rm(filePath, { force: true }),
-      fs.promises.rm(pdfFilePath, { force: true })
-    ]);
-    throw new Error(
-      `Unable to convert PPTX to PDF on the server. ${error.message}`
-    );
-  }
+  return { fileName, filePath };
 }
 
 async function storeLessonFile(preparedFile, mimeType) {
