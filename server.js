@@ -1501,6 +1501,104 @@ app.post('/api/teaching/quizzes', authenticateToken, requireTeachingStaff, async
   }
 });
 
+app.patch('/api/teaching/quizzes/:quizId', authenticateToken, requireTeachingStaff, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.quizId)) {
+      return res.status(400).json({ error: 'Valid quiz is required.' });
+    }
+
+    const { title, description, questions } = req.body;
+    if (typeof title !== 'string' || !title.trim()) {
+      return res.status(400).json({ error: 'A quiz title is required.' });
+    }
+    if (!Array.isArray(questions) || questions.length < 10 || questions.length > 20) {
+      return res.status(400).json({ error: 'A quiz must contain between 10 and 20 questions.' });
+    }
+
+    const quiz = await quizzesCollection.findOne({ _id: new ObjectId(req.params.quizId) });
+    if (!quiz) return res.status(404).json({ error: 'Quiz not found.' });
+    if (!await hasTeachingAssignment(req.user.userId, quiz.subjectId.toString(), req.user.role)) {
+      return res.status(403).json({ error: 'You can only edit quizzes for assigned subjects.' });
+    }
+
+    const normalizedQuestions = questions.map((question) => ({
+      question: typeof question?.question === 'string' ? question.question.trim() : '',
+      options: Array.isArray(question?.options)
+        ? question.options.map((option) => typeof option === 'string' ? option.trim() : '')
+        : [],
+      correctOption: question?.correctOption
+    }));
+    const invalidQuestion = normalizedQuestions.some((question) =>
+      !question.question ||
+      question.options.length !== 4 ||
+      question.options.some((option) => !option) ||
+      !Number.isInteger(question.correctOption) ||
+      question.correctOption < 0 ||
+      question.correctOption > 3
+    );
+    if (invalidQuestion) {
+      return res.status(400).json({
+        error: 'Each question needs text, exactly four non-empty options, and a valid correct answer.'
+      });
+    }
+
+    const assignmentQuery = { subjectId: quiz.subjectId };
+    if (req.user.role !== 'program_chair') {
+      assignmentQuery.facultyId = new ObjectId(req.user.userId);
+    }
+    const assignment = await assignmentsCollection.findOne(assignmentQuery);
+    const subject = await subjectsCollection.findOne({ _id: quiz.subjectId });
+    const section = assignment ? await sectionsCollection.findOne({ _id: assignment.sectionId }) : null;
+    const updatedAt = new Date();
+    const updatedQuiz = await quizzesCollection.findOneAndUpdate(
+      { _id: quiz._id },
+      {
+        $set: {
+          title: title.trim(),
+          description: typeof description === 'string' ? description.trim() : '',
+          questions: normalizedQuestions,
+          updatedAt
+        }
+      },
+      { returnDocument: 'after' }
+    );
+
+    return res.json({
+      quiz: serializeQuiz({
+        ...updatedQuiz,
+        subjectCode: subject?.code,
+        sectionName: section?.name
+      }, true)
+    });
+  } catch (error) {
+    console.error('Error updating quiz:', error);
+    return res.status(500).json({ error: 'Failed to update quiz.' });
+  }
+});
+
+app.delete('/api/teaching/quizzes/:quizId', authenticateToken, requireTeachingStaff, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.quizId)) {
+      return res.status(400).json({ error: 'Valid quiz is required.' });
+    }
+
+    const quiz = await quizzesCollection.findOne({ _id: new ObjectId(req.params.quizId) });
+    if (!quiz) return res.status(404).json({ error: 'Quiz not found.' });
+    if (!await hasTeachingAssignment(req.user.userId, quiz.subjectId.toString(), req.user.role)) {
+      return res.status(403).json({ error: 'You can only delete quizzes for assigned subjects.' });
+    }
+
+    await Promise.all([
+      quizzesCollection.deleteOne({ _id: quiz._id }),
+      quizSubmissionsCollection.deleteMany({ quizId: quiz._id })
+    ]);
+    return res.json({ message: 'Quiz deleted successfully.' });
+  } catch (error) {
+    console.error('Error deleting quiz:', error);
+    return res.status(500).json({ error: 'Failed to delete quiz.' });
+  }
+});
+
 app.get('/api/teaching/quizzes/:quizId/submissions', authenticateToken, requireTeachingStaff, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.quizId)) {
